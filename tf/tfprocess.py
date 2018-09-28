@@ -382,8 +382,9 @@ class TFProcess:
 
         assert channels % ratio == 0
 
-        net = tf.nn.avg_pool(x, [1, 1, 8, 8], [1, 1, 1, 1],
-                             padding='VALID', data_format='NCHW')
+        #net = tf.nn.avg_pool(x, [1, 1, 8, 8], [1, 1, 1, 1],
+        #                     padding='VALID', data_format='NCHW')
+        net = tf.reduce_mean(x, axis=[2, 3])
 
         net_flat = tf.reshape(net, [-1, channels])
 
@@ -457,26 +458,23 @@ class TFProcess:
         W_conv_2 = weight_variable([3, 3, channels, channels], name=conv_key_2)
 
         with tf.variable_scope(weight_key_1):
-            h_bn1 = \
-                tf.layers.batch_normalization(
-                    conv2d(inputs, W_conv_1),
+            h_out_1 = \
+                    conv2d(tf.nn.relu(tf.layers.batch_normalization(inputs,
                     epsilon=1e-5, axis=1, fused=True,
                     center=True, scale=False,
                     virtual_batch_size=64,
-                    training=self.training)
-        h_out_1 = tf.nn.relu(h_bn1)
+                    training=self.training)), W_conv_1)
         with tf.variable_scope(weight_key_2):
             h_bn2 = \
-                tf.layers.batch_normalization(
-                    conv2d(h_out_1, W_conv_2),
+                    conv2d(tf.nn.relu(tf.layers.batch_normalization(h_out_1,
                     epsilon=1e-5, axis=1, fused=True,
                     center=True, scale=True,
                     virtual_batch_size=64,
-                    training=self.training)
+                    training=self.training)), W_conv_2)
 
         with tf.variable_scope(weight_key_2):
             h_se = self.squeeze_excitation(h_bn2, channels, self.SE_ratio)
-        h_out_2 = tf.nn.relu(tf.add(h_se, orig))
+        h_out_2 = tf.add(h_se, orig)
 
         beta_key_1 = weight_key_1 + "/batch_normalization/beta:0"
         mean_key_1 = weight_key_1 + "/batch_normalization/moving_mean:0"
