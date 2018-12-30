@@ -25,7 +25,7 @@ import bisect
 
 from net import Net
 
-def weight_variable(shape, name=None):
+def weight_variable(shape, name=None, trainable=True):
     """Xavier initialization"""
     if len(shape) == 4:
         receptive_field = shape[0] * shape[1]
@@ -38,16 +38,16 @@ def weight_variable(shape, name=None):
     trunc_correction = np.sqrt(1.3)
     stddev = trunc_correction * np.sqrt(2.0 / (fan_in + fan_out))
     initial = tf.truncated_normal(shape, stddev=stddev)
-    weights = tf.Variable(initial, name=name)
+    weights = tf.Variable(initial, name=name, trainable=trainable)
     tf.add_to_collection(tf.GraphKeys.REGULARIZATION_LOSSES, weights)
     return weights
 
 # Bias weights for layers not followed by BatchNorm
 # We do not regularlize biases, so they are not
 # added to the regularlizer collection
-def bias_variable(shape, name=None):
+def bias_variable(shape, name=None, trainable=True):
     initial = tf.constant(0.0, shape=shape)
-    return tf.Variable(initial, name=name)
+    return tf.Variable(initial, name=name, trainable=trainable)
 
 def conv2d(x, W):
     return tf.nn.conv2d(x, W, data_format='NCHW',
@@ -79,7 +79,8 @@ def optimistic_restore(session, save_file, graph=tf.get_default_graph()):
 class TFProcess:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.net = Net()
+        self.wdl = self.cfg['model']['wdl']
+        self.net = Net(self.wdl)
         self.root_dir = os.path.join(self.cfg['training']['path'], self.cfg['name'])
 
         # Network structure
@@ -115,7 +116,7 @@ class TFProcess:
     def init_net(self, next_batch):
         self.x = next_batch[0]  # tf.placeholder(tf.float32, [None, 112, 8*8])
         self.y_ = next_batch[1] # tf.placeholder(tf.float32, [None, 1858])
-        self.z_ = next_batch[2] # tf.placeholder(tf.float32, [None, 1])
+        self.z_ = next_batch[2] # tf.placeholder(tf.float32, [None, 3])
         self.batch_norm_count = 0
         self.y_conv, self.z_conv = self.construct_net(self.x)
 
@@ -125,17 +126,22 @@ class TFProcess:
                                                     logits=self.y_conv)
         self.policy_loss = tf.reduce_mean(policy_cross_entropy)
 
-        # Loss on value head
-        value_cross_entropy = \
-            tf.nn.softmax_cross_entropy_with_logits(labels=self.z_,
-                                                    logits=self.z_conv)
-        self.value_loss = tf.reduce_mean(value_cross_entropy)
         # Linear conversion to scalar to compute MSE with, for comparison to old values
         wdl = tf.expand_dims(tf.constant([1.0, 0.0, -1.0]), 1)
         scalar_z = tf.matmul(self.z_, wdl)
-        scalar_z_conv = tf.matmul(tf.nn.softmax(self.z_conv), wdl)
-        self.mse_loss = \
-            tf.reduce_mean(tf.squared_difference(scalar_z, scalar_z_conv))
+
+        # Loss on value head
+        if self.wdl:
+            value_cross_entropy = \
+                tf.nn.softmax_cross_entropy_with_logits(labels=self.z_,
+                                                    logits=self.z_conv)
+            self.value_loss = tf.reduce_mean(value_cross_entropy)
+            scalar_z_conv = tf.matmul(tf.nn.softmax(self.z_conv), wdl)
+            self.mse_loss = \
+                tf.reduce_mean(tf.squared_difference(scalar_z, scalar_z_conv))
+        else:
+            self.mse_loss = \
+                tf.reduce_mean(tf.squared_difference(scalar_z, self.z_conv))
 
         # Regularizer
         regularizer = tf.contrib.layers.l2_regularizer(scale=0.0001)
@@ -147,7 +153,11 @@ class TFProcess:
         # want to reduce the factor in front of self.mse_loss here.
         pol_loss_w = self.cfg['training']['policy_loss_weight']
         val_loss_w = self.cfg['training']['value_loss_weight']
-        loss = pol_loss_w * self.policy_loss + val_loss_w * self.value_loss + self.reg_term
+        if self.wdl:
+            value_loss = self.value_loss
+        else:
+            value_loss = self.mse_loss
+        loss = pol_loss_w * self.policy_loss + val_loss_w * value_loss + self.reg_term
 
         # Set adaptive learning rate during training
         self.cfg['training']['lr_boundaries'].sort()
@@ -272,7 +282,7 @@ class TFProcess:
 
     def restore(self, file):
         print("Restoring from {0}".format(file))
-        self.saver.restore(self.session, file)
+        optimistic_restore(self.session, file)
 
     def process_loop(self, batch_size, test_batches, batch_splits=1):
         # Get the initial steps value in case this is a resume from a step count
@@ -588,14 +598,15 @@ class TFProcess:
         self.batch_norm_count += 1
         return result
 
-    def conv_block(self, inputs, filter_size, input_channels, output_channels):
+    def conv_block(self, inputs, filter_size, input_channels, output_channels, trainable=True):
         # The weights are internal to the batchnorm layer, so apply
         # a unique scope that we can store, and use to look them back up
         # later on.
         weight_key = self.get_batchnorm_key()
         conv_key = weight_key + "/conv_weight"
         W_conv = weight_variable([filter_size, filter_size,
-                                  input_channels, output_channels], name=conv_key)
+                                  input_channels, output_channels], name=conv_key,
+                                  trainable=trainable)
 
         with tf.variable_scope(weight_key):
             h_bn = \
@@ -604,7 +615,8 @@ class TFProcess:
                     epsilon=1e-5, axis=1, fused=True,
                     center=True, scale=False,
                     virtual_batch_size=64,
-                    training=self.training)
+                    training=self.training,
+                    trainable=trainable)
         h_conv = tf.nn.relu(h_bn)
 
         beta_key = weight_key + "/batch_normalization/beta:0"
@@ -622,17 +634,19 @@ class TFProcess:
 
         return h_conv
 
-    def residual_block(self, inputs, channels):
+    def residual_block(self, inputs, channels, trainable=True):
         # First convnet
         orig = tf.identity(inputs)
         weight_key_1 = self.get_batchnorm_key()
         conv_key_1 = weight_key_1 + "/conv_weight"
-        W_conv_1 = weight_variable([3, 3, channels, channels], name=conv_key_1)
+        W_conv_1 = weight_variable([3, 3, channels, channels], name=conv_key_1,
+                trainable=trainable)
 
         # Second convnet
         weight_key_2 = self.get_batchnorm_key()
         conv_key_2 = weight_key_2 + "/conv_weight"
-        W_conv_2 = weight_variable([3, 3, channels, channels], name=conv_key_2)
+        W_conv_2 = weight_variable([3, 3, channels, channels], name=conv_key_2,
+                trainable=trainable)
 
         with tf.variable_scope(weight_key_1):
             h_bn1 = \
@@ -641,7 +655,8 @@ class TFProcess:
                     epsilon=1e-5, axis=1, fused=True,
                     center=True, scale=False,
                     virtual_batch_size=64,
-                    training=self.training)
+                    training=self.training,
+                    trainable=trainable)
         h_out_1 = tf.nn.relu(h_bn1)
         with tf.variable_scope(weight_key_2):
             h_bn2 = \
@@ -650,7 +665,8 @@ class TFProcess:
                     epsilon=1e-5, axis=1, fused=True,
                     center=True, scale=False,
                     virtual_batch_size=64,
-                    training=self.training)
+                    training=self.training,
+                    trainable=trainable)
         h_out_2 = tf.nn.relu(tf.add(h_bn2, orig))
 
         beta_key_1 = weight_key_1 + "/batch_normalization/beta:0"
@@ -686,21 +702,26 @@ class TFProcess:
         # batch, 112 input channels, 8 x 8
         x_planes = tf.reshape(planes, [-1, 112, 8, 8])
 
+        trainable = True
+
         # Input convolution
         flow = self.conv_block(x_planes, filter_size=3,
                                input_channels=112,
-                               output_channels=self.RESIDUAL_FILTERS)
+                               output_channels=self.RESIDUAL_FILTERS,
+                               trainable=trainable)
         # Residual tower
         for _ in range(0, self.RESIDUAL_BLOCKS):
-            flow = self.residual_block(flow, self.RESIDUAL_FILTERS)
+            flow = self.residual_block(flow, self.RESIDUAL_FILTERS,
+                    trainable=trainable)
 
         # Policy head
         conv_pol = self.conv_block(flow, filter_size=1,
                                    input_channels=self.RESIDUAL_FILTERS,
-                                   output_channels=32)
+                                   output_channels=32,
+                                   trainable=False)
         h_conv_pol_flat = tf.reshape(conv_pol, [-1, 32*8*8])
-        W_fc1 = weight_variable([32*8*8, 1858], name='fc1/weight')
-        b_fc1 = bias_variable([1858], name='fc1/bias')
+        W_fc1 = weight_variable([32*8*8, 1858], name='fc1/weight', trainable=trainable)
+        b_fc1 = bias_variable([1858], name='fc1/bias', trainable=trainable)
         self.weights.append(W_fc1)
         self.weights.append(b_fc1)
         h_fc1 = tf.add(tf.matmul(h_conv_pol_flat, W_fc1), b_fc1, name='policy_head')
@@ -708,15 +729,17 @@ class TFProcess:
         # Value head
         conv_val = self.conv_block(flow, filter_size=1,
                                    input_channels=self.RESIDUAL_FILTERS,
-                                   output_channels=32)
+                                   output_channels=32,
+                                   trainable=trainable)
         h_conv_val_flat = tf.reshape(conv_val, [-1, 32*8*8])
         W_fc2 = weight_variable([32 * 8 * 8, 128], name='fc2/weight')
         b_fc2 = bias_variable([128], name='fc2/bias')
         self.weights.append(W_fc2)
         self.weights.append(b_fc2)
         h_fc2 = tf.nn.relu(tf.add(tf.matmul(h_conv_val_flat, W_fc2), b_fc2))
-        W_fc3 = weight_variable([128, 3], name='fc3/weight')
-        b_fc3 = bias_variable([3], name='fc3/bias')
+        value_outputs = 3 if self.wdl else 1
+        W_fc3 = weight_variable([128, value_outputs], name='fc3/weight')
+        b_fc3 = bias_variable([value_outputs], name='fc3/bias')
         self.weights.append(W_fc3)
         self.weights.append(b_fc3)
         h_fc3 = tf.add(tf.matmul(h_fc2, W_fc3), b_fc3, name='value_head')
