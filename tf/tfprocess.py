@@ -702,7 +702,7 @@ class TFProcess:
         # batch, 112 input channels, 8 x 8
         x_planes = tf.reshape(planes, [-1, 112, 8, 8])
 
-        trainable = True
+        trainable = False
 
         # Input convolution
         flow = self.conv_block(x_planes, filter_size=3,
