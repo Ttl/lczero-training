@@ -25,6 +25,7 @@ import shufflebuffer as sb
 import struct
 import tensorflow as tf
 import unittest
+import queue
 
 V4_VERSION = struct.pack('i', 4)
 V3_VERSION = struct.pack('i', 3)
@@ -89,15 +90,21 @@ class ChunkParser:
         self.readers = []
         self.writers = []
         self.processes = []
+        self.cmd_queues = []
         for _ in range(workers):
             read, write = mp.Pipe(duplex=False)
-            p = mp.Process(target=self.task, args=(chunkdatasrc, write))
+            cmd_queue = mp.Queue()
+            self.cmd_queues.append(cmd_queue)
+            p = mp.Process(target=self.task, args=(chunkdatasrc, write, cmd_queue))
             self.processes.append(p)
             p.start()
             self.readers.append(read)
             self.writers.append(write)
         self.init_structs()
 
+    def new_chunks(self, new):
+        for q in self.cmd_queues:
+            q.put(new)
 
     def shutdown(self):
         """
@@ -231,13 +238,22 @@ class ChunkParser:
             yield record
 
 
-    def task(self, chunkdatasrc, writer):
+    def task(self, chunkdatasrc, writer, cmd_queue):
         """
         Run in fork'ed process, read data from chunkdatasrc, parsing, shuffling and
         sending v4 data through pipe back to main process.
         """
         self.init_structs()
+        i = 0
         while True:
+            i += 1
+            if i > 10:
+                i = 0
+                try:
+                    new_chunks = cmd_queue.get(block=False)
+                    chunkdatasrc.chunks = new_chunks
+                except queue.Empty:
+                    pass
             chunkdata = chunkdatasrc.next()
             if chunkdata is None:
                 break
