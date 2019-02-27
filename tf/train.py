@@ -52,7 +52,7 @@ def get_latest_chunks(path, num_chunks):
     random.shuffle(chunks)
     return chunks
 
-def get_window_chunks(path, num_chunks, start):
+def get_window_chunks(path, num_chunks, train_ratio, start):
     chunks = []
     for d in glob.glob(path):
         chunks += get_chunks(d)
@@ -65,11 +65,26 @@ def get_window_chunks(path, num_chunks, start):
 
     chunks.sort(key=get_folder)
 
-    chunks = chunks[start:start + num_chunks]
+    train_chunks = []
+    test_chunks = []
+    for i in range(len(chunks)):
+        if len(train_chunks) <= i * train_ratio:
+            train_chunks.append(chunks[i])
+        else:
+            test_chunks.append(chunks[i])
 
-    print("{} - {}".format(chunks[-1], chunks[0]))
-    random.shuffle(chunks)
-    return chunks
+    train_start = int(train_ratio * start)
+    num_train_chunks = int(train_ratio * num_chunks)
+    test_start = int((1 - train_ratio) * start)
+    num_test_chunks = int((1 - train_ratio) * num_chunks)
+    train_chunks = train_chunks[train_start:train_start + num_train_chunks]
+    test_chunks = test_chunks[test_start:test_start + num_test_chunks]
+
+    print("{} - {}".format(train_chunks[-1], train_chunks[0]))
+    print("{} - {}".format(test_chunks[-1], test_chunks[0]))
+    random.shuffle(train_chunks)
+    random.shuffle(test_chunks)
+    return train_chunks, test_chunks
 
 class FileDataSrc:
     """
@@ -113,12 +128,10 @@ def get_train_test_chunks(cfg, chunks_start):
     num_train = int(num_chunks * train_ratio)
     num_test = num_chunks - num_train
     if 'input_test' in cfg['dataset']:
-        train_chunks = get_window_chunks(cfg['dataset']['input_train'], num_train, chunks_start)
+        train_chunks, _ = get_window_chunks(cfg['dataset']['input_train'], num_train, 1, chunks_start)
         test_chunks = get_latest_chunks(cfg['dataset']['input_test'], num_test)
     else:
-        chunks = get_window_chunks(cfg['dataset']['input'], num_chunks, chunks_start)
-        train_chunks = chunks[:num_train]
-        test_chunks = chunks[num_train:]
+        train_chunks, test_chunks = get_window_chunks(cfg['dataset']['input'], num_chunks, train_ratio, chunks_start)
     return train_chunks, test_chunks
 
 def replay(cmd, cfg):
@@ -198,7 +211,7 @@ def replay(cmd, cfg):
             break
         chunks_start += games_per_net
         train_chunks, test_chunks = get_train_test_chunks(cfg, chunks_start)
-        if len(train_chunks) < num_train:
+        if len(train_chunks) < 0.9 * num_train:
             print("Ran out of training chunks")
             break
         train_parser.new_chunks(train_chunks)
