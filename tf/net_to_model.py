@@ -32,6 +32,7 @@ x = [
     tf.placeholder(tf.float32, [None, 1858]),
     tf.placeholder(tf.float32, [None, 3]),
     tf.placeholder(tf.float32, [None, 3]),
+    tf.placeholder(tf.int32, [None, 1]),
     ]
 
 tfp = tfprocess.TFProcess(cfg)

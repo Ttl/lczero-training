@@ -28,7 +28,7 @@ import proto.net_pb2 as pb
 from net import Net
 
 
-def weight_variable(shape, name=None):
+def weight_variable(shape, name=None, trainable=False):
     """Xavier initialization"""
     if len(shape) == 4:
         receptive_field = shape[0] * shape[1]
@@ -41,7 +41,7 @@ def weight_variable(shape, name=None):
     trunc_correction = np.sqrt(1.3)
     stddev = trunc_correction * np.sqrt(2.0 / (fan_in + fan_out))
     initial = tf.truncated_normal(shape, stddev=stddev)
-    weights = tf.Variable(initial, name=name)
+    weights = tf.Variable(initial, name=name, trainable=trainable)
     tf.add_to_collection(tf.GraphKeys.REGULARIZATION_LOSSES, weights)
     return weights
 
@@ -50,9 +50,9 @@ def weight_variable(shape, name=None):
 # added to the regularlizer collection
 
 
-def bias_variable(shape, name=None):
+def bias_variable(shape, name=None, trainable=False):
     initial = tf.constant(0.0, shape=shape)
-    return tf.Variable(initial, name=name)
+    return tf.Variable(initial, name=name, trainable=trainable)
 
 
 def conv2d(x, W):
@@ -198,9 +198,10 @@ class TFProcess:
             m_dot = tf.tensordot(moves, tf.nn.softmax(self.m_conv), axes=[[0],[1]])
             moves_left_abs = tf.abs(((tf.cast(self.m_, tf.float32) - m_dot)))
             self.moves_left_abs = tf.reduce_mean(moves_left_abs)
+            moves_left_mse = tf.reduce_mean(tf.square(((tf.cast(self.m_, tf.float32) - m_dot))/30.0))
             m_one_hot = tf.one_hot(self.m_, self.MAX_MOVES_LEFT)
             self.moves_left_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(
-                                    labels=m_one_hot, logits=self.m_conv))
+                                    labels=m_one_hot, logits=self.m_conv)) + 0.05 * moves_left_mse
         else:
             self.moves_left_loss = tf.constant(0.0, dtype=tf.float32)
 
@@ -310,6 +311,9 @@ class TFProcess:
     def replace_weights(self, new_weights):
         all_evals = []
         for e, weights in enumerate(self.weights):
+            print(e, weights.name)
+            if e >= len(new_weights):
+                continue
             if weights.shape.ndims == 4:
                 # Rescale rule50 related weights as clients do not normalize the input.
                 if e == 0:
@@ -552,6 +556,8 @@ class TFProcess:
         else:
             test_summaries = tf.Summary(value=[
                 tf.Summary.Value(tag="Policy Accuracy", simple_value=sum_policy_accuracy),
+                tf.Summary.Value(tag="Moves Left Loss", simple_value=sum_moves_left),
+                tf.Summary.Value(tag="Moves Left Mean Error", simple_value=sum_moves_left_abs),
                 tf.Summary.Value(tag="Policy Loss", simple_value=sum_policy),
                 tf.Summary.Value(tag="MSE Loss", simple_value=sum_mse)]).SerializeToString()
         test_summaries = tf.summary.merge(
@@ -723,7 +729,7 @@ class TFProcess:
 
         return out
 
-    def batch_norm(self, inputs, scale=False):
+    def batch_norm(self, inputs, scale=False, trainable=False):
         if self.renorm_enabled:
             clipping = {
                 "rmin": 1.0/self.renorm_max_r,
@@ -737,23 +743,31 @@ class TFProcess:
                 renorm_momentum=self.renorm_momentum,
                 training=self.training)
         else:
-            return tf.layers.batch_normalization(
-                inputs, epsilon=1e-5, axis=1, fused=True,
-                center=True, scale=scale,
-                virtual_batch_size=64,
-                training=self.training)
+            if trainable:
+                return tf.layers.batch_normalization(
+                    inputs, epsilon=1e-5, axis=1, fused=True,
+                    center=True, scale=scale,
+                    virtual_batch_size=64,
+                    training=self.training)
+            else:
+                return tf.layers.batch_normalization(
+                    inputs, epsilon=1e-5, axis=1, fused=True,
+                    center=True, scale=scale,
+                    virtual_batch_size=64,
+                    training=False,
+                    trainable=False)
 
-    def conv_block(self, inputs, filter_size, input_channels, output_channels, bn_scale=False):
+    def conv_block(self, inputs, filter_size, input_channels, output_channels, bn_scale=False, trainable=False):
         # The weights are internal to the batchnorm layer, so apply
         # a unique scope that we can store, and use to look them back up
         # later on.
         weight_key = self.get_batchnorm_key()
         conv_key = weight_key + "/conv_weight"
         W_conv = weight_variable([filter_size, filter_size,
-                                  input_channels, output_channels], name=conv_key)
+                                  input_channels, output_channels], name=conv_key, trainable=trainable)
 
         with tf.variable_scope(weight_key):
-            h_bn = self.batch_norm(conv2d(inputs, W_conv), scale=bn_scale)
+            h_bn = self.batch_norm(conv2d(inputs, W_conv), scale=bn_scale, trainable=trainable)
         h_conv = tf.nn.relu(h_bn)
 
         gamma_key = weight_key + "/batch_normalization/gamma"
@@ -793,18 +807,19 @@ class TFProcess:
         W_conv_2 = weight_variable([3, 3, channels, channels], name=conv_key_2)
 
         with tf.variable_scope(weight_key_1):
-            h_bn1 = self.batch_norm(conv2d(inputs, W_conv_1))
+            h_bn1 = self.batch_norm(conv2d(inputs, W_conv_1), scale=True)
         h_out_1 = tf.nn.relu(h_bn1)
         with tf.variable_scope(weight_key_2):
             h_bn2 = self.batch_norm(conv2d(h_out_1, W_conv_2), scale=True)
 
-        gamma_key_1 = weight_key_1 + "/batch_normalization/gamma"
+        gamma_key_1 = weight_key_1 + "/batch_normalization/gamma:0"
         beta_key_1 = weight_key_1 + "/batch_normalization/beta:0"
         mean_key_1 = weight_key_1 + "/batch_normalization/moving_mean:0"
         var_key_1 = weight_key_1 + "/batch_normalization/moving_variance:0"
 
-        gamma_1 = tf.Variable(tf.ones(shape=[channels]),
-                              name=gamma_key_1, trainable=False)
+        #gamma_1 = tf.Variable(tf.ones(shape=[channels]),
+        #                      name=gamma_key_1, trainable=False)
+        gamma_1 = tf.get_default_graph().get_tensor_by_name(gamma_key_1)
         beta_1 = tf.get_default_graph().get_tensor_by_name(beta_key_1)
         mean_1 = tf.get_default_graph().get_tensor_by_name(mean_key_1)
         var_1 = tf.get_default_graph().get_tensor_by_name(var_key_1)
@@ -856,7 +871,8 @@ class TFProcess:
         if self.POLICY_HEAD == pb.NetworkFormat.POLICY_CONVOLUTION:
             conv_pol = self.conv_block(flow, filter_size=3,
                                        input_channels=self.RESIDUAL_FILTERS,
-                                       output_channels=self.RESIDUAL_FILTERS)
+                                       output_channels=self.RESIDUAL_FILTERS,
+                                       bn_scale=True)
             W_pol_conv = weight_variable([3, 3,
                                           self.RESIDUAL_FILTERS, 80], name='W_pol_conv2')
             b_pol_conv = bias_variable([80], name='b_pol_conv2')
@@ -893,7 +909,8 @@ class TFProcess:
         # Value head
         conv_val = self.conv_block(flow, filter_size=1,
                                    input_channels=self.RESIDUAL_FILTERS,
-                                   output_channels=32)
+                                   output_channels=32,
+                                   bn_scale=True)
         h_conv_val_flat = tf.reshape(conv_val, [-1, 32*8*8])
         W_fc2 = weight_variable([32 * 8 * 8, 128], name='fc2/weight')
         b_fc2 = bias_variable([128], name='fc2/bias')
@@ -915,15 +932,16 @@ class TFProcess:
         if self.moves_left:
             conv_mov = self.conv_block(flow, filter_size=1,
                                        input_channels=self.RESIDUAL_FILTERS,
-                                       output_channels=8)
+                                       output_channels=8,
+                                       trainable=True)
             h_conv_mov_flat = tf.reshape(conv_mov, [-1, 8*8*8])
-            W_fc4 = weight_variable([8 * 8 * 8, 512], name='fc4/weight')
-            b_fc4 = bias_variable([512], name='fc4/bias')
+            W_fc4 = weight_variable([8 * 8 * 8, 512], name='fc4/weight', trainable=True)
+            b_fc4 = bias_variable([512], name='fc4/bias', trainable=True)
             self.weights.append(W_fc4)
             self.weights.append(b_fc4)
             h_fc4 = tf.nn.relu(tf.add(tf.matmul(h_conv_mov_flat, W_fc4), b_fc4))
-            W_fc5 = weight_variable([512, self.MAX_MOVES_LEFT], name='fc5/weight')
-            b_fc5 = bias_variable([self.MAX_MOVES_LEFT], name='fc5/bias')
+            W_fc5 = weight_variable([512, self.MAX_MOVES_LEFT], name='fc5/weight', trainable=True)
+            b_fc5 = bias_variable([self.MAX_MOVES_LEFT], name='fc5/bias', trainable=True)
             self.weights.append(W_fc5)
             self.weights.append(b_fc5)
             h_fc5 = tf.add(tf.matmul(h_fc4, W_fc5), b_fc5, name='moves_head')
