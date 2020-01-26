@@ -86,16 +86,13 @@ class FixupLayer(tf.keras.layers.Layer):
         else:
             return inputs + tf.cast(beta, dtype)
 
-def fixup_init(channels, block):
-    """Xavier initialization"""
+def fixup_init(channels, blocks):
+    # He initialization
     receptive_field = 3 * 3
     fan_in = channels * receptive_field
-    fan_out = channels * receptive_field
-    # truncated normal has lower stddev than a regular normal distribution, so need to correct for that
-    trunc_correction = np.sqrt(1.3)
-    stddev = trunc_correction * np.sqrt(2.0 / (fan_in + fan_out))
-    fixup_scale = 1.0 / np.sqrt(block)
-    return tf.keras.initializers.TruncatedNormal(fixup_scale * stddev)
+    stddev = np.sqrt(2.0 / fan_in)
+    fixup_scale = 1.0 / np.sqrt(blocks)
+    return tf.keras.initializers.TruncatedNormal(mean=0, stddev=fixup_scale * stddev)
 
 class TFProcess:
     def __init__(self, cfg):
@@ -207,8 +204,7 @@ class TFProcess:
             return target, output
         def policy_loss(target, output):
             target, output = correct_policy(target, output)
-            policy_cross_entropy = \
-                tf.nn.softmax_cross_entropy_with_logits(labels=tf.stop_gradient(target),
+            policy_cross_entropy = tf.nn.softmax_cross_entropy_with_logits(labels=tf.stop_gradient(target),
                                                         logits=output)
             return tf.reduce_mean(input_tensor=policy_cross_entropy)
         self.policy_loss_fn = policy_loss
@@ -229,8 +225,7 @@ class TFProcess:
         if self.wdl:
             def value_loss(target, output):
                 output = tf.cast(output, tf.float32)
-                value_cross_entropy = \
-                    tf.nn.softmax_cross_entropy_with_logits(labels=tf.stop_gradient(target),
+                value_cross_entropy = tf.nn.softmax_cross_entropy_with_logits(labels=tf.stop_gradient(target),
                                                     logits=output)
                 return tf.reduce_mean(input_tensor=value_cross_entropy)
             self.value_loss_fn = value_loss
@@ -443,8 +438,7 @@ class TFProcess:
         # Make sure that ghost batch norm can be applied
         if batch_size % 64 != 0:
             # Adjust required batch size for batch splitting.
-            required_factor = 64 * \
-                self.cfg['training'].get('num_batch_splits', 1)
+            required_factor = 64 * self.cfg['training'].get('num_batch_splits', 1)
             raise ValueError(
                 'batch_size must be a multiple of {}'.format(required_factor))
 
@@ -807,13 +801,13 @@ class TFProcess:
         return ApplySqueezeExcitation()([inputs, excited])
 
     def conv_block_v2(self, inputs, filter_size, output_channels, bn_scale=False):
-        conv = tf.keras.layers.Conv2D(output_channels, filter_size, use_bias=False, padding='same', kernel_initializer='glorot_normal', kernel_regularizer=self.l2reg, data_format='channels_first')(inputs)
-        return tf.keras.layers.Activation('relu')(FixupLayer(scale=bn_scale)(conv))
+        conv = tf.keras.layers.Conv2D(output_channels, filter_size, use_bias=False, padding='same', kernel_initializer=tf.initializers.he_normal(), kernel_regularizer=self.l2reg, data_format='channels_first')(inputs)
+        return tf.keras.layers.Activation('relu')(FixupLayer()(conv))
         #return tf.keras.layers.Activation('relu')(self.batch_norm_v2(conv, scale=bn_scale))
 
     def residual_block_v2(self, inputs, channels):
         conv1 = tf.keras.layers.Conv2D(channels, 3, use_bias=False, padding='same', kernel_initializer=fixup_init(channels, self.RESIDUAL_BLOCKS), kernel_regularizer=self.l2reg, data_format='channels_first')(inputs)
-        out1 = tf.keras.layers.Activation('relu')(FixupLayer(scale=False)(conv1))
+        out1 = tf.keras.layers.Activation('relu')(FixupLayer()(conv1))
         #out1 = tf.keras.layers.Activation('relu')(self.batch_norm_v2(conv1, scale=False))
         conv2 = tf.keras.layers.Conv2D(channels, 3, use_bias=False, padding='same', kernel_initializer='zeros', kernel_regularizer=self.l2reg, data_format='channels_first')(out1)
         out2 = self.squeeze_excitation_v2(FixupLayer()(conv2), channels)
@@ -827,7 +821,7 @@ class TFProcess:
         # Policy head
         if self.POLICY_HEAD == pb.NetworkFormat.POLICY_CONVOLUTION:
             conv_pol = self.conv_block_v2(flow, filter_size=3, output_channels=self.RESIDUAL_FILTERS)
-            conv_pol2 = tf.keras.layers.Conv2D(80, 3, use_bias=True, padding='same', kernel_initializer='glorot_normal', kernel_regularizer=self.l2reg, bias_regularizer=self.l2reg, data_format='channels_first')(conv_pol)
+            conv_pol2 = tf.keras.layers.Conv2D(80, 3, use_bias=True, padding='same', kernel_initializer=tf.initializers.he_normal(), kernel_regularizer=self.l2reg, bias_regularizer=self.l2reg, data_format='channels_first')(conv_pol)
             h_fc1 = ApplyPolicyMap()(conv_pol2)
         elif self.POLICY_HEAD == pb.NetworkFormat.POLICY_CLASSICAL:
             conv_pol = self.conv_block_v2(flow, filter_size=1, output_channels=self.policy_channels)
