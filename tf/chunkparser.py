@@ -26,6 +26,7 @@ import struct
 import tensorflow as tf
 import unittest
 import lc0_az_policy_map
+import gzip
 
 V4_VERSION = struct.pack('i', 4)
 V3_VERSION = struct.pack('i', 3)
@@ -48,15 +49,37 @@ def flip_vertex(v):
     c = 7 - c
     return 8 * r + c
 
+def chunk_reader(chunk_filenames, output_queue):
+    """
+    Reads chunk filenames from a list and writes them in shuffled
+    order to output_queue.
+    """
+    chunks = []
+    done = chunk_filenames
+
+    while True:
+        if not chunks:
+            chunks, done = done, chunks
+            random.shuffle(chunks)
+        if not chunks:
+            print("chunk_reader didn't find any chunks.")
+            return None
+        while len(chunks):
+            filename = chunks.pop()
+            done.append(filename)
+            output_queue.put(filename)
+    print("chunk_reader exiting.")
+    return None
+
 class ChunkParser:
     # static batch size
     BATCH_SIZE = 8
-    def __init__(self, chunkdatasrc, shuffle_size=1, sample=1, buffer_size=1,
+    def __init__(self, chunks, shuffle_size=1, sample=1, buffer_size=1,
             batch_size=256, workers=None, flip=False):
         """
         Read data and yield batches of raw tensors.
 
-        'chunkdatasrc' is an object yeilding chunkdata
+        'chunks' list of chunk filenames.
         'shuffle_size' is the size of the shuffle buffer.
         'sample' is the rate to down-sample.
         'workers' is the number of child workers to use.
@@ -103,13 +126,19 @@ class ChunkParser:
 
         print("Using {} worker processes.".format(workers))
 
+        chunk_queue = mp.Queue(maxsize=512)
+        self.chunk_process = mp.Process(target=chunk_reader, args=(chunks, chunk_queue))
+        self.chunk_process.daemon = True
+        self.chunk_process.start()
+
         # Start the child workers running
         self.readers = []
         self.writers = []
         self.processes = []
         for _ in range(workers):
             read, write = mp.Pipe(duplex=False)
-            p = mp.Process(target=self.task, args=(chunkdatasrc, write))
+            p = mp.Process(target=self.task, args=(chunk_queue, write))
+            p.daemon = True
             self.processes.append(p)
             p.start()
             self.readers.append(read)
@@ -126,6 +155,8 @@ class ChunkParser:
             self.processes[i].join()
             self.readers[i].close()
             self.writers[i].close()
+        self.chunk_process.terminate()
+        self.chunk_process.join()
 
 
     def init_structs(self):
@@ -315,22 +346,23 @@ class ChunkParser:
                 record += 16 * b'\x00'
             yield record
 
-
-    def task(self, chunkdatasrc, writer):
+    def task(self, chunk_queue, writer):
         """
         Run in fork'ed process, read data from chunkdatasrc, parsing, shuffling and
         sending v4 data through pipe back to main process.
         """
         self.init_structs()
         while True:
-            chunkdata = chunkdatasrc.next()
+            filename = chunk_queue.get()
+            try:
+                with gzip.open(filename, 'rb') as chunk_file:
+                    chunkdata = chunk_file.read()
+            except:
+                print("failed to parse {}".format(filename))
+                continue
             if chunkdata is None:
                 break
             for item in self.sample_record(chunkdata):
-                # NOTE: This requires some more thinking, we can't just apply a
-                # reflection along the horizontal or vertical axes as we would
-                # also have to apply the reflection to the move probabilities
-                # which is non trivial for chess.
                 writer.send_bytes(item)
 
 
