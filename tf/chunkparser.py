@@ -264,38 +264,6 @@ class ChunkParser:
                 probs = probs[self.policy_flip_map]
                 probs = probs.tobytes()
 
-        if self.flip:
-            can_flip = True
-            if not (us_ooo == us_oo == them_ooo == them_oo == 0):
-                can_flip = False
-            if can_flip and random.randrange(2) == 0:
-                can_flip = False
-            if can_flip:
-                # Count from the last position in the history.
-                pieces = np.sum(planes[13*7*64:-64])
-                if pieces > 16:
-                    can_flip = False
-            if can_flip:
-                # King plane of last position in the history.
-                our_king = planes[6144:6208]
-                their_king = planes[6528:6592]
-                our_king_pos = np.where(our_king == 1)[0]
-                their_king_pos = np.where(their_king == 1)[0]
-                if len(our_king_pos) != 1:
-                    return False, None
-                if len(their_king_pos) != 1:
-                    return False, None
-                # Default and castling positions.
-                if our_king_pos[0] in (2, 4, 6):
-                    can_flip = False
-                if their_king_pos[0] in (60, 62, 64):
-                    can_flip = False
-            if can_flip:
-                planes = planes[self.full_flip_map]
-                probs = np.frombuffer(probs, dtype=np.float32)
-                probs = probs[self.policy_flip_map]
-                probs = probs.tobytes()
-
         # Concatenate all byteplanes. Make the last plane all 1's so the NN can
         # detect edges of the board more easily
         planes = planes.tobytes() + \
@@ -346,6 +314,7 @@ class ChunkParser:
                 record += 16 * b'\x00'
             yield record
 
+
     def task(self, chunk_queue, writer):
         """
         Run in fork'ed process, read data from chunkdatasrc, parsing, shuffling and
@@ -356,15 +325,25 @@ class ChunkParser:
             filename = chunk_queue.get()
             try:
                 with gzip.open(filename, 'rb') as chunk_file:
-                    chunkdata = chunk_file.read()
+                    version = chunk_file.read(4)
+                    chunk_file.seek(0)
+                    if version == V4_VERSION:
+                        record_size = self.v4_struct.size
+                    elif version == V3_VERSION:
+                        record_size = self.v3_struct.size
+                    else:
+                        print('Unknown version {} in file {}'.format(version, filename))
+                        continue
+                    while True:
+                        chunkdata = chunk_file.read(512 * record_size)
+                        if len(chunkdata) == 0:
+                            break
+                        for item in self.sample_record(chunkdata):
+                            writer.send_bytes(item)
+
             except:
                 print("failed to parse {}".format(filename))
                 continue
-            if chunkdata is None:
-                break
-            for item in self.sample_record(chunkdata):
-                writer.send_bytes(item)
-
 
     def v4_gen(self):
         """
